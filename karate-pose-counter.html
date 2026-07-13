@@ -65,7 +65,7 @@
 </head>
 <body>
 
-<div class="eyebrow">空手 <b>／</b> 突き・蹴り 自動カウント</div>
+<div class="eyebrow">空手 <b>／</b> 突き・蹴り 自動カウント <b>v2</b></div>
 
 <div class="view">
   <video id="cam" playsinline muted autoplay></video>
@@ -89,19 +89,14 @@
   <summary>判定の調整</summary>
 
   <div class="row">
-    <label>突き 伸ばし</label>
-    <input type="range" id="pHi" min="1.45" max="2.10" step="0.01" value="1.72">
-    <span class="val" id="pHiV">1.72</span>
+    <label>突き 敏感さ</label>
+    <input type="range" id="pSen" min="1" max="10" step="1" value="6">
+    <span class="val" id="pSenV">6</span>
   </div>
   <div class="row">
-    <label>突き 戻し</label>
-    <input type="range" id="pLo" min="1.00" max="1.65" step="0.01" value="1.42">
-    <span class="val" id="pLoV">1.42</span>
-  </div>
-  <div class="row">
-    <label>蹴り 高さ</label>
-    <input type="range" id="kHi" min="-0.85" max="0.20" step="0.01" value="-0.50">
-    <span class="val" id="kHiV">-0.50</span>
+    <label>蹴り 敏感さ</label>
+    <input type="range" id="kSen" min="1" max="10" step="1" value="6">
+    <span class="val" id="kSenV">6</span>
   </div>
 
   <div class="live">
@@ -112,9 +107,10 @@
   </div>
 
   <p class="note">
-    腕の数値は「肩から手首までの距離 ÷ 肩幅」。構えで約1.2、突き切ると約1.9になります。<br>
-    実際に突いて数値を見ながら、伸ばし＝突き切った値より少し低め、戻し＝構えの値より少し高めに設定してください。<br>
-    脚の数値は足首の高さ。立っている状態が −1.0、腰の高さまで上げると 0 付近です。
+    v2から、構えの姿勢を自動で学習して「基準からどれだけ伸びたか」で判定します。細かい数値合わせは不要です。<br>
+    取りこぼしが多いときは敏感さを上げ、誤カウントが多いときは下げてください。<br>
+    数値は「基準からの伸び」。突き・蹴りの瞬間に大きくなれば正しく認識できています。<br>
+    コツ：全身が画面に入る距離（2〜3m）で、体は斜め45°〜横向き、明るい場所で。
   </p>
 </details>
 
@@ -135,18 +131,27 @@ let facing='user', lastTs=-1, rafId=null;
 let punch=0, kick=0, pL=0, pR=0, kL=0, kR=0;
 let hits=[], endAt=0;
 
-// 各手足の状態を覚えておく（伸ばした→戻った、の一往復で1回と数える）
+// 各手足の状態（伸ばした→戻った、の一往復で1回と数える）
+// v2: base=構えの姿勢を自動学習した基準値。「基準からの伸び」で判定するので調整がほぼ不要
 const S = {
-  la:{out:false,t:0}, ra:{out:false,t:0},
-  ll:{out:false,t:0}, rl:{out:false,t:0}
+  la:{v:null,base:null,out:false,t:0,last:0},
+  ra:{v:null,base:null,out:false,t:0,last:0},
+  ll:{v:null,base:null,out:false,t:0,last:0,maxExt:0},
+  rl:{v:null,base:null,out:false,t:0,last:0,maxExt:0}
 };
-const REFRACTORY = 200;   // 同じ手足で連続カウントする最短間隔(ms)
-const MAX_CYCLE  = 1500;  // 伸ばしてから戻るまでの制限時間(ms)。これを超えたら突きではないと判断
+const P_REFRACTORY = 250, K_REFRACTORY = 350;  // 同じ手足の連続カウント最短間隔(ms)
+const P_CYCLE = 1300, K_CYCLE = 1800;          // 伸ばして戻るまでの制限時間(ms)
 
-// スライダー
-for(const [s,v] of [['pHi','pHiV'],['pLo','pLoV'],['kHi','kHiV']]){
-  $(s).oninput = () => $(v).textContent = (+$(s).value).toFixed(2);
+// iOS Safariはビデオフレームに同期した処理が可能（フレーム落ち対策）
+const hasVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+
+// スライダー（敏感さ）
+for(const [s,v] of [['pSen','pSenV'],['kSen','kSenV']]){
+  $(s).oninput = () => $(v).textContent = $(s).value;
 }
+// 敏感さ → 判定に使う「基準からの伸び幅」。敏感なほど小さい幅で反応する
+const armDelta = () => 0.70 - 0.05 * (+$('pSen').value);   // 既定6 → 0.40
+const legDelta = () => 0.80 - 0.05 * (+$('kSen').value);   // 既定6 → 0.50
 
 const d3 = (a,b) => Math.hypot(a.x-b.x, a.y-b.y, a.z-b.z);
 
@@ -159,7 +164,7 @@ async function start(){
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
       landmarker = await PoseLandmarker.createFromOptions(files, {
         baseOptions:{
-          modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+          modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
           delegate:"GPU"
         },
         runningMode:"VIDEO",
@@ -186,6 +191,7 @@ async function start(){
   ov.width = cam.videoWidth; ov.height = cam.videoHeight;
   load.style.display = 'none';
 
+  for(const k in S){ const s=S[k]; s.v=null; s.base=null; s.out=false; s.t=0; }
   running = true; endAt = performance.now() + 5*60*1000;
   go.textContent = '停止'; go.classList.add('on');
   loop();
@@ -193,7 +199,7 @@ async function start(){
 
 function stop(){
   running = false;
-  if(rafId) cancelAnimationFrame(rafId);
+  if(rafId){ hasVFC ? cam.cancelVideoFrameCallback(rafId) : cancelAnimationFrame(rafId); }
   if(stream) stream.getTracks().forEach(t=>t.stop());
   stream = null; lastTs = -1;
   ctx.clearRect(0,0,ov.width,ov.height);
@@ -205,7 +211,7 @@ function stop(){
 // ── 毎フレームの処理 ──────────────────────
 function loop(){
   if(!running) return;
-  rafId = requestAnimationFrame(loop);
+  rafId = hasVFC ? cam.requestVideoFrameCallback(loop) : requestAnimationFrame(loop);
 
   const now = performance.now();
 
@@ -216,8 +222,10 @@ function loop(){
   $('timer').classList.toggle('warn', left < 30000);
   if(left <= 0){ stop(); return; }
 
-  if(cam.currentTime === lastTs) return;
-  lastTs = cam.currentTime;
+  if(!hasVFC){
+    if(cam.currentTime === lastTs) return;
+    lastTs = cam.currentTime;
+  }
 
   const res = landmarker.detectForVideo(cam, now);
   ctx.clearRect(0,0,ov.width,ov.height);
@@ -246,30 +254,42 @@ function loop(){
   const llExt = d3(w[L_HIP], w[L_ANK]) / llLen;        // 膝の伸び具合（1に近いほど伸びている）
   const rlExt = d3(w[R_HIP], w[R_ANK]) / rlLen;
 
-  $('dLA').textContent = la.toFixed(2);
-  $('dRA').textContent = ra.toFixed(2);
-  $('dLL').textContent = ll.toFixed(2);
-  $('dRL').textContent = rl.toFixed(2);
+  // 見えていない手足は判定しない（誤検出・誤学習防止）
+  const vis = i => (lm[i].visibility ?? 1) > 0.4;
 
-  const HI = +$('pHi').value, LO = +$('pLo').value, KH = +$('kHi').value;
+  // 突き：基準（構え）から一定以上伸びて戻ったら1回
+  if(vis(L_WR)) armCycle('la', la, now, 'L');
+  if(vis(R_WR)) armCycle('ra', ra, now, 'R');
+  // 蹴り：足首が基準から一定以上上がり、動作中に膝が伸びていれば1回
+  if(vis(L_ANK)) legCycle('ll', ll, llExt, now, 'L');
+  if(vis(R_ANK)) legCycle('rl', rl, rlExt, now, 'R');
 
-  // 突きの判定：しきい値を超えて伸びた → 戻った、で1回
-  armCycle('la', la, HI, LO, now, 'L');
-  armCycle('ra', ra, HI, LO, now, 'R');
-  // 蹴りの判定：足が上がり、かつ膝が伸びた → 下ろした、で1回
-  legCycle('ll', ll, llExt, KH, now, 'L');
-  legCycle('rl', rl, rlExt, KH, now, 'R');
+  // 表示は「基準からの伸び」
+  const dv = s => s.base===null ? '—' : (s.v - s.base).toFixed(2);
+  $('dLA').textContent = dv(S.la);
+  $('dRA').textContent = dv(S.ra);
+  $('dLL').textContent = dv(S.ll);
+  $('dRL').textContent = dv(S.rl);
 
   const recent = hits.filter(t => now - t < 15000).length;
   $('rate').textContent = Math.round(recent*4) + ' 打／分';
 }
 
-function armCycle(key, val, HI, LO, now, side){
+// 値を軽く平滑化しつつ、構え（基準値）をゆっくり学習する。
+// 基準値は「下がるときは速く・上がるときはゆっくり」追従させ、動作中に基準が釣られるのを防ぐ
+function track(s, val){
+  if(s.v === null){ s.v = val; s.base = val; return; }
+  s.v += 0.7 * (val - s.v);
+  s.base += (s.v - s.base) * (s.v < s.base ? 0.15 : 0.01);
+}
+
+function armCycle(key, val, now, side){
   const s = S[key];
-  if(!s.out && val > HI){ s.out = true; s.t = now; }
-  else if(s.out && val < LO){
+  track(s, val);
+  if(!s.out && s.v > s.base + armDelta()){ s.out = true; s.t = now; }
+  else if(s.out && s.v < s.base + armDelta()*0.45){
     s.out = false;
-    if(now - s.t < MAX_CYCLE && now - (s.last||0) > REFRACTORY){
+    if(now - s.t < P_CYCLE && now - s.last > P_REFRACTORY){
       s.last = now; punch++; side==='L' ? pL++ : pR++;
       hits.push(now);
       $('punch').textContent = punch;
@@ -279,17 +299,22 @@ function armCycle(key, val, HI, LO, now, side){
   }
 }
 
-function legCycle(key, height, ext, KH, now, side){
+function legCycle(key, height, ext, now, side){
   const s = S[key];
-  if(!s.out && height > KH && ext > 0.82){ s.out = true; s.t = now; }
-  else if(s.out && height < KH - 0.25){
-    s.out = false;
-    if(now - s.t < MAX_CYCLE + 500 && now - (s.last||0) > REFRACTORY*1.5){
-      s.last = now; kick++; side==='L' ? kL++ : kR++;
-      hits.push(now);
-      $('kick').textContent = kick;
-      $('klr').textContent = `左 ${kL} ／ 右 ${kR}`;
-      flash('kick');
+  track(s, height);
+  if(!s.out && s.v > s.base + legDelta()){ s.out = true; s.t = now; s.maxExt = ext; }
+  else if(s.out){
+    // 動作中の「膝の伸びの最大値」を記録（伸び切る瞬間がフレームの隙間でも拾える）
+    s.maxExt = Math.max(s.maxExt, ext);
+    if(s.v < s.base + legDelta()*0.5){
+      s.out = false;
+      if(now - s.t < K_CYCLE && now - s.last > K_REFRACTORY && s.maxExt > 0.78){
+        s.last = now; kick++; side==='L' ? kL++ : kR++;
+        hits.push(now);
+        $('kick').textContent = kick;
+        $('klr').textContent = `左 ${kL} ／ 右 ${kR}`;
+        flash('kick');
+      }
     }
   }
 }
